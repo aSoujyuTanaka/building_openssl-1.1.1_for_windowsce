@@ -8,5 +8,5 @@ wince_openssl-1.1.1b.patch: patch for OpenSSL 1.1.1b
 ### How to patch
 mv to the top of original OpenSSL directory and
 ```bash
-$ patch -s -p0 < ../wince_openssl-1.1.1b2.patch
+$ patch -s -p0 < ../wince_openssl-1.1.1b.patch
 ```
