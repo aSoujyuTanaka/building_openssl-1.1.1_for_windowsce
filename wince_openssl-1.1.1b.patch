@@ -1,0 +1,317 @@
+diff -Naru ../orig/crypto/bio/bss_file.c ./crypto/bio/bss_file.c
+--- ../orig/crypto/bio/bss_file.c	2019-03-27 17:41:41.259758448 +0900
++++ ./crypto/bio/bss_file.c	2019-03-27 17:54:41.000000000 +0900
+@@ -33,8 +33,6 @@
+ # include "bio_lcl.h"
+ # include <openssl/err.h>
+ 
+-# if !defined(OPENSSL_NO_STDIO)
+-
+ static int file_write(BIO *h, const char *buf, int num);
+ static int file_read(BIO *h, char *buf, int size);
+ static int file_puts(BIO *h, const char *str);
+@@ -364,64 +362,4 @@
+     return ret;
+ }
+ 
+-#else
+-
+-static int file_write(BIO *b, const char *in, int inl)
+-{
+-    return -1;
+-}
+-static int file_read(BIO *b, char *out, int outl)
+-{
+-    return -1;
+-}
+-static int file_puts(BIO *bp, const char *str)
+-{
+-    return -1;
+-}
+-static int file_gets(BIO *bp, char *buf, int size)
+-{
+-    return 0;
+-}
+-static long file_ctrl(BIO *b, int cmd, long num, void *ptr)
+-{
+-    return 0;
+-}
+-static int file_new(BIO *bi)
+-{
+-    return 0;
+-}
+-static int file_free(BIO *a)
+-{
+-    return 0;
+-}
+-
+-static const BIO_METHOD methods_filep = {
+-    BIO_TYPE_FILE,
+-    "FILE pointer",
+-    /* TODO: Convert to new style write function */
+-    bwrite_conv,
+-    file_write,
+-    /* TODO: Convert to new style read function */
+-    bread_conv,
+-    file_read,
+-    file_puts,
+-    file_gets,
+-    file_ctrl,
+-    file_new,
+-    file_free,
+-    NULL,                      /* file_callback_ctrl */
+-};
+-
+-const BIO_METHOD *BIO_s_file(void)
+-{
+-    return &methods_filep;
+-}
+-
+-BIO *BIO_new_file(const char *filename, const char *mode)
+-{
+-    return NULL;
+-}
+-
+-# endif                         /* OPENSSL_NO_STDIO */
+-
+ #endif                          /* HEADER_BSS_FILE_C */
+diff -Naru ../orig/crypto/dso/dso_win32.c ./crypto/dso/dso_win32.c
+--- ../orig/crypto/dso/dso_win32.c	2019-03-27 17:41:41.275758448 +0900
++++ ./crypto/dso/dso_win32.c	2019-03-27 17:53:48.000000000 +0900
+@@ -64,6 +64,7 @@
+ static char *win32_name_converter(DSO *dso, const char *filename);
+ static char *win32_merger(DSO *dso, const char *filespec1,
+                           const char *filespec2);
++static int win32_pathbyaddr(void *addr, char *path, int sz);
+ static void *win32_globallookup(const char *name);
+ 
+ static const char *openssl_strnchr(const char *string, int c, size_t len);
+@@ -78,7 +79,7 @@
+     win32_merger,
+     NULL,                       /* init */
+     NULL,                       /* finish */
+-    NULL,                       /* pathbyaddr */
++    win32_pathbyaddr,           /* pathbyaddr */
+     win32_globallookup
+ };
+ 
+@@ -500,6 +501,106 @@
+ typedef BOOL(WINAPI *CLOSETOOLHELP32SNAPSHOT) (HANDLE);
+ typedef BOOL(WINAPI *MODULE32) (HANDLE, MODULEENTRY32 *);
+ 
++static int win32_pathbyaddr(void *addr, char *path, int sz)
++{
++    HMODULE dll;
++    HANDLE hModuleSnap = INVALID_HANDLE_VALUE;
++    MODULEENTRY32 me32;
++    CREATETOOLHELP32SNAPSHOT create_snap;
++    CLOSETOOLHELP32SNAPSHOT close_snap;
++    MODULE32 module_first, module_next;
++
++    if (addr == NULL) {
++        union {
++            int (*f) (void *, char *, int);
++            void *p;
++        } t = {
++            win32_pathbyaddr
++        };
++        addr = t.p;
++    }
++
++    dll = LoadLibrary(TEXT(DLLNAME));
++    if (dll == NULL) {
++        DSOerr(DSO_F_WIN32_PATHBYADDR, DSO_R_UNSUPPORTED);
++        return -1;
++    }
++
++    create_snap = (CREATETOOLHELP32SNAPSHOT)
++        GetProcAddress(dll, "CreateToolhelp32Snapshot");
++    if (create_snap == NULL) {
++        FreeLibrary(dll);
++        DSOerr(DSO_F_WIN32_PATHBYADDR, DSO_R_UNSUPPORTED);
++        return -1;
++    }
++    /* We take the rest for granted... */
++# ifdef _WIN32_WCE
++    close_snap = (CLOSETOOLHELP32SNAPSHOT)
++        GetProcAddress(dll, "CloseToolhelp32Snapshot");
++# else
++    close_snap = (CLOSETOOLHELP32SNAPSHOT) CloseHandle;
++# endif
++    module_first = (MODULE32) GetProcAddress(dll, "Module32First");
++    module_next = (MODULE32) GetProcAddress(dll, "Module32Next");
++
++    hModuleSnap = (*create_snap) (TH32CS_SNAPMODULE, 0);
++    if (hModuleSnap == INVALID_HANDLE_VALUE) {
++        FreeLibrary(dll);
++        DSOerr(DSO_F_WIN32_PATHBYADDR, DSO_R_UNSUPPORTED);
++        return -1;
++    }
++
++    me32.dwSize = sizeof(me32);
++
++    if (!(*module_first) (hModuleSnap, &me32)) {
++        (*close_snap) (hModuleSnap);
++        FreeLibrary(dll);
++        DSOerr(DSO_F_WIN32_PATHBYADDR, DSO_R_FAILURE);
++        return -1;
++    }
++
++    do {
++        if ((BYTE *) addr >= me32.modBaseAddr &&
++            (BYTE *) addr < me32.modBaseAddr + me32.modBaseSize) {
++            (*close_snap) (hModuleSnap);
++            FreeLibrary(dll);
++# ifdef _WIN32_WCE
++#  if _WIN32_WCE >= 101
++            return WideCharToMultiByte(CP_ACP, 0, me32.szExePath, -1,
++                                       path, sz, NULL, NULL);
++#  else
++            {
++                int i, len = (int)wcslen(me32.szExePath);
++                if (sz <= 0)
++                    return len + 1;
++                if (len >= sz)
++                    len = sz - 1;
++                for (i = 0; i < len; i++)
++                    path[i] = (char)me32.szExePath[i];
++                path[len++] = 0;
++                return len;
++            }
++#  endif
++# else
++            {
++                int len = (int)strlen(me32.szExePath);
++                if (sz <= 0)
++                    return len + 1;
++                if (len >= sz)
++                    len = sz - 1;
++                memcpy(path, me32.szExePath, len);
++                path[len++] = 0;
++                return len;
++            }
++# endif
++        }
++    } while ((*module_next) (hModuleSnap, &me32));
++
++    (*close_snap) (hModuleSnap);
++    FreeLibrary(dll);
++    return 0;
++}
++
+ static void *win32_globallookup(const char *name)
+ {
+     HMODULE dll;
+diff -Naru ../orig/crypto/init.c ./crypto/init.c
+--- ../orig/crypto/init.c	2019-03-27 17:41:41.287758448 +0900
++++ ./crypto/init.c	2019-03-27 17:52:32.000000000 +0900
+@@ -164,7 +164,7 @@
+ #if !defined(OPENSSL_NO_DSO) \
+     && !defined(OPENSSL_USE_NODELETE) \
+     && !defined(OPENSSL_NO_PINSHARED)
+-# ifdef DSO_WIN32
++# if defined(DSO_WIN32) && !defined(_WIN32_WCE)
+     {
+         HMODULE handle = NULL;
+         BOOL ret;
+@@ -774,7 +774,7 @@
+         } handlersym;
+ 
+         handlersym.func = handler;
+-# ifdef DSO_WIN32
++# if defined(DSO_WIN32) && !defined(_WIN32_WCE)
+         {
+             HMODULE handle = NULL;
+             BOOL ret;
+diff -Naru ../orig/crypto/o_fopen.c ./crypto/o_fopen.c
+--- ../orig/crypto/o_fopen.c	2019-03-27 17:41:41.339758448 +0900
++++ ./crypto/o_fopen.c	2019-03-27 17:51:31.000000000 +0900
+@@ -28,8 +28,6 @@
+ #include "e_os.h"
+ #include "internal/cryptlib.h"
+ 
+-#if !defined(OPENSSL_NO_STDIO)
+-
+ # include <stdio.h>
+ # ifdef __DJGPP__
+ #  include <unistd.h>
+@@ -115,12 +113,3 @@
+ # endif
+     return file;
+ }
+-
+-#else
+-
+-void *openssl_fopen(const char *filename, const char *mode)
+-{
+-    return NULL;
+-}
+-
+-#endif
+diff -Naru ../orig/crypto/rand/randfile.c ./crypto/rand/randfile.c
+--- ../orig/crypto/rand/randfile.c	2019-03-27 17:41:41.391758447 +0900
++++ ./crypto/rand/randfile.c	2019-03-27 17:53:06.000000000 +0900
+@@ -254,7 +254,7 @@
+     size_t len;
+     int use_randfile = 1;
+ 
+-#if defined(_WIN32) && defined(CP_UTF8)
++#if defined(_WIN32) && defined(CP_UTF8) && !defined(_WIN32_WCE)
+     DWORD envlen;
+     WCHAR *var;
+ 
+diff -Naru ../orig/crypto/threads_win.c ./crypto/threads_win.c
+--- ../orig/crypto/threads_win.c	2019-03-27 17:41:41.403758447 +0900
++++ ./crypto/threads_win.c	2019-03-27 17:50:51.000000000 +0900
+@@ -24,11 +24,15 @@
+         return NULL;
+     }
+ 
++#if !defined(_WIN32_WCE)
+     /* 0x400 is the spin count value suggested in the documentation */
+     if (!InitializeCriticalSectionAndSpinCount(lock, 0x400)) {
+         OPENSSL_free(lock);
+         return NULL;
+     }
++#else
++    InitializeCriticalSection(lock);
++#endif
+ 
+     return lock;
+ }
+diff -Naru ../orig/include/internal/refcount.h ./include/internal/refcount.h
+--- ../orig/include/internal/refcount.h	2019-03-27 17:41:41.435758447 +0900
++++ ./include/internal/refcount.h	2019-03-27 17:49:36.000000000 +0900
+@@ -99,17 +99,29 @@
+     return 1;
+ }
+ #  else
+-#   pragma intrinsic(_InterlockedExchangeAdd)
++#   if !defined(_WIN32_WCE)
++#    pragma intrinsic(_InterlockedExchangeAdd)
++#    define INTERLOCKED_EXCHANGE_ADD _InterlockedExchangeAdd
++#   else
++#    if _WIN32_WCE >= 0x600
++      extern long __cdecl _InterlockedExchangeAdd(long volatile*, long);
++#     define INTERLOCKED_EXCHANGE_ADD _InterlockedExchangeAdd
++#    else
++      // under Windows CE we still have old-style Interlocked* functions
++      extern long __cdecl InterlockedExchangeAdd(long volatile*, long);
++#     define INTERLOCKED_EXCHANGE_ADD InterlockedExchangeAdd
++#    endif
++#   endif
+ 
+ static __inline int CRYPTO_UP_REF(volatile int *val, int *ret, void *lock)
+ {
+-    *ret = _InterlockedExchangeAdd(val, 1) + 1;
++    *ret = INTERLOCKED_EXCHANGE_ADD(val, 1) + 1;
+     return 1;
+ }
+ 
+ static __inline int CRYPTO_DOWN_REF(volatile int *val, int *ret, void *lock)
+ {
+-    *ret = _InterlockedExchangeAdd(val, -1) - 1;
++    *ret = INTERLOCKED_EXCHANGE_ADD(val, -1) - 1;
+     return 1;
+ }
+ #  endif
